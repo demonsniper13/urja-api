@@ -1,73 +1,173 @@
-# Urja Meter Ops protocol notes
+# Urja Meter Ops - Protocol Notes
 
-These notes describe the portal behavior observed through normal logged-in use and read-only HTTP requests.
+This document summarizes what I learned while exploring the Urja Meter Ops
+website and how those findings were used to build the API service.
 
-## Application and authentication
+The investigation was limited to normal logged-in, read-only use of the portal.
+No write operations were performed.
 
-The frontend appears to be SvelteKit and uses a Better Auth session cookie.
+## Website overview
 
-Login is a form-encoded `POST /login` with `email` and `password`. The request needs the portal `Origin` header. A successful HTTP status alone is not a reliable login check because redirects may be followed. The client therefore checks for `__Secure-better-auth.session_token`.
+Urja Meter Ops is a web application used to view smart-meter information.
 
-Requests without a valid session return `401`.
+From the browser traffic, I found that the website does not require browser
+automation for every operation. The frontend makes HTTP requests in the
+background to retrieve meter, transformer, location and energy information.
 
-## Data endpoints
+This was useful because the new API service could communicate with those
+HTTP endpoints directly instead of running a browser for every API request.
 
-### Meter search
+The frontend appears to be built with SvelteKit, and authentication uses a
+Better Auth session cookie.
 
-`GET /portal/meters/search?q=&page=N`
+## How I investigated the portal
 
-Returns `data`, `total`, `page` and `pageSize`. Search is case-insensitive and matches text inside meter ID or serial number. It did not match transformer code during investigation.
+I first used the website normally in a browser and observed its network
+traffic.
 
-### Transformers
+I used Playwright to record a HAR file while navigating the portal. The HAR
+helped identify which HTTP requests were made when logging in and viewing
+different types of meter data.
 
-`GET /portal/dts?page=N`
+I then used a small Python/httpx script to repeat the useful requests outside
+the browser.
 
-Returns transformer code, name, feeder code and capacity. The endpoint is paginated and has no observed search parameter.
+This confirmed that a browser was not required at runtime once the login and
+request behavior were understood.
 
-### Meter geo
+One request, the bulk meter export, required additional signing headers. I
+inspected the frontend JavaScript involved in that request and reproduced the
+same signing calculation in Python.
 
-`GET /portal/meters/{id}/geo`
+The final API service uses these findings through a normal HTTP client rather
+than through Playwright.
 
-Returns `latitude` and `longitude` as strings. The bulk export instead returns numeric `lat` and `lng`. A v2 sample returned more decimal precision from this endpoint than from the export.
+## Authentication
 
-### Meter energy
+The portal uses a normal login form.
 
-`GET /portal/meters/{id}/energy`
+The login request is made using:
 
-Returns readings containing `timestamp`, `kwh`, `kvah` and `voltR`. Values are strings. Timestamps use `DD/MM/YYYY HH:mm` and do not include a timezone. kWh and kVAh appear to be cumulative totals.
+`POST /login`
 
-### Signing key
+with the email and password sent as form data.
 
-`GET /portal/keys`
+The request also needs the portal's `Origin` header.
 
-Returns the export signing secret to a logged-in user. This weakens the security value of signing because the same user who calls the export can retrieve its key.
+After a successful login, the portal creates a session cookie named:
 
-### Bulk export
+`__Secure-better-auth.session_token`
 
-`GET /portal/export?page=1`
+The API client keeps this cookie and automatically sends it with later portal
+requests.
 
-The browser signs this request. The observed signing input was:
+I found that checking only the final HTTP status is not a reliable way of
+confirming login. The HTTP client may follow redirects and end on a page that
+returns `200`.
 
-```text
-GET\n/portal/export\npage=1\n<unix_seconds>
-```
+For this reason, the API checks that the session cookie was actually created.
 
-The signature is the lowercase hexadecimal HMAC-SHA256 digest using the portal-provided signing secret. It is sent in `x-signature`; the timestamp is sent in `x-timestamp`. The signature must be produced with a fresh timestamp.
+If the portal later returns `401`, the API treats the session as expired,
+clears the old session information and logs in again.
 
-Although the request includes `page=1`, the observed response returned the full meter dataset in one call. The API service uses this as its local query source.
+## Meter data
 
-## Errors
+The portal provides meter information containing fields such as:
 
-Unknown meter IDs on geo or energy returned a `404` response with a not-found error. Missing or invalid export signatures returned `401`.
+- meter ID
+- serial number
+- manufacturer
+- phase type
+- installation status
+- installation type
+- build/version
+- transformer code
+- network hierarchy
+- location
 
-## Data quirks
+During investigation I found 403 meters in the dataset.
 
-- Export geo values are numeric; the dedicated geo endpoint returns strings.
-- Energy values are strings and timestamps omit timezone information.
-- The export and detailed geo endpoint may use different coordinate precision.
-- Serial-number prefixes should not be treated as a reliable manufacturer identifier.
-- The export contains hierarchy data down to feeder and distribution transformer.
+The hierarchy attached to a meter includes information for:
 
-## Security handling
+- zone
+- circle
+- division
+- subdivision
+- substation
+- feeder
+- distribution transformer
 
-Credentials are loaded from `.env`. The repository must not contain the portal password, signing secret, session cookie or HAR capture. The service keeps the signing secret only in memory for the current session.
+This hierarchy is preserved by the new API rather than being discarded.
+
+## Meter search
+
+While using the portal, I observed a meter search request under the portal
+routes.
+
+The search behavior I tested matched meter IDs and serial numbers and was
+case-insensitive.
+
+Searching using a transformer code did not behave like a meter-ID or serial
+search.
+
+Because the bulk meter dataset was available, the new API does not depend on
+the portal search for its filtering features.
+
+Instead, it retrieves the meter dataset and supports its own filters for
+attributes such as manufacturer, status, phase, build, feeder and transformer.
+
+## Transformer data
+
+The portal also exposes distribution-transformer data.
+
+The transformer records I observed contained information such as:
+
+- transformer code
+- transformer name
+- feeder code
+- capacity
+
+The transformer data was paginated.
+
+I found 40 transformers during the investigation.
+
+I did not observe a useful transformer search capability in the portal, so
+transformer searching in the new API is performed locally.
+
+The meter data contains a transformer code, which also made it possible to
+link meters to their corresponding transformer in the new service.
+
+## Meter location
+
+The portal provides location information for individual meters.
+
+One inconsistency I noticed was that location information does not always use
+the same representation.
+
+In the bulk meter data, coordinates are numeric values named:
+
+`lat`
+`lng`
+
+The dedicated meter location response uses:
+
+`latitude`
+`longitude`
+
+and the values are strings.
+
+I also observed a precision difference for one v2 meter: the detailed location
+contained more decimal places than the location in the bulk data.
+
+I did not test enough v2 meters to conclude that this always happens.
+
+For this reason, the new API uses the bulk coordinates when returning meter
+lists and uses the dedicated location data when returning a single meter.
+
+The API normalizes both formats into:
+
+```json
+{
+  "lat": 26.93,
+  "lng": 75.83
+}
